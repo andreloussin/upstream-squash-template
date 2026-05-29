@@ -1,0 +1,188 @@
+name: Sync Upstream via PR
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_repo:
+        description: "Upstream repository in owner/repo format"
+        required: false
+        type: string
+      upstream_branch:
+        description: "Override upstream branch"
+        required: false
+        type: string
+      base_branch:
+        description: "Local base branch used for the PR"
+        required: false
+        type: string
+      sync_branch:
+        description: "Temporary branch used for the squash sync"
+        required: false
+        type: string
+      sync_state_file:
+        description: "Path to the file storing the last synced upstream SHA"
+        required: false
+        type: string
+      force_sync:
+        description: "Force a sync even if the upstream SHA has not changed"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  UPSTREAM_REPO: ${{ inputs.upstream_repo || vars.UPSTREAM_REPO }}
+  UPSTREAM_BRANCH: ${{ inputs.upstream_branch || vars.UPSTREAM_BRANCH || 'main' }}
+  BASE_BRANCH: ${{ inputs.base_branch || vars.BASE_BRANCH || 'main' }}
+  SYNC_BRANCH: ${{ inputs.sync_branch || vars.SYNC_BRANCH || 'sync-upstream-updates' }}
+  SYNC_STATE_FILE: ${{ inputs.sync_state_file || vars.SYNC_STATE_FILE || '.github/upstream-sync.sha' }}
+  FORCE_SYNC: ${{ inputs.force_sync || 'false' }}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validate configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "${UPSTREAM_REPO}" ]; then
+            echo "UPSTREAM_REPO is not configured."
+            exit 1
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ env.BASE_BRANCH }}
+
+      - name: Configure Git
+        shell: bash
+        run: |
+          git config --global user.name "GitHub Action"
+          git config --global user.email "action@github.com"
+
+      - name: Add upstream remote
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || \ 
+          git remote set-url upstream "https://github.com/${UPSTREAM_REPO}.git"
+
+      - name: Fetch branches
+        id: fetch
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git fetch origin "${BASE_BRANCH}"
+          git fetch upstream "${UPSTREAM_BRANCH}"
+
+          echo "sync_date=$(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> "$GITHUB_OUTPUT"
+
+      - name: Read last synced SHA
+        id: state
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -f "${SYNC_STATE_FILE}" ]; then
+            LAST_SYNC_SHA="$(tr -d '[:space:]' < "${SYNC_STATE_FILE}")"
+          else
+            LAST_SYNC_SHA=""
+          fi
+
+          CURRENT_UPSTREAM_SHA="$(git rev-parse "upstream/${UPSTREAM_BRANCH}")"
+
+          echo "last_sync_sha=${LAST_SYNC_SHA}" >> "$GITHUB_OUTPUT"
+          echo "current_upstream_sha=${CURRENT_UPSTREAM_SHA}" >> "$GITHUB_OUTPUT"
+
+          if [ "${FORCE_SYNC}" = "true" ]; then
+            echo "should_sync=true" >> "$GITHUB_OUTPUT"
+          elif [ -n "${LAST_SYNC_SHA}" ] && [ "${LAST_SYNC_SHA}" = "${CURRENT_UPSTREAM_SHA}" ]; then
+            echo "No upstream changes to sync."
+            echo "should_sync=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_sync=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Stop if nothing changed
+        if: steps.state.outputs.should_sync != 'true'
+        shell: bash
+        run: |
+          echo "Repository already synchronized with upstream."
+          exit 0
+
+      - name: Create sync branch from base branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git switch -C "${SYNC_BRANCH}" "origin/${BASE_BRANCH}"
+
+      - name: Squash merge upstream changes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git merge --squash --allow-unrelated-histories "upstream/${UPSTREAM_BRANCH}"
+
+          mkdir -p "$(dirname "${SYNC_STATE_FILE}")"
+          printf '%s' "${{ steps.state.outputs.current_upstream_sha }}" > "${SYNC_STATE_FILE}"
+
+          git add "${SYNC_STATE_FILE}"
+          git commit -m "chore(sync): sync upstream ${UPSTREAM_REPO}@${{ steps.state.outputs.current_upstream_sha }}"
+
+      - name: Push sync branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git push origin "${SYNC_BRANCH}" --force-with-lease
+
+      - name: Create or update pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          OWNER_REPO="${GITHUB_REPOSITORY}"
+          TITLE="chore: sync latest upstream changes"
+          HEAD="${SYNC_BRANCH}"
+          BODY="$(bash .github/scripts/generate-sync-pr-body.sh \
+            "${{ steps.state.outputs.last_sync_sha }}" \
+            "${{ steps.state.outputs.current_upstream_sha }}" \
+            "${UPSTREAM_REPO}" \
+            "${UPSTREAM_BRANCH}" \
+            "${{ steps.state.outputs.sync_date }}")"
+
+
+          PR_COUNT="$(curl -sS \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${OWNER_REPO}/pulls?state=open&head=${GITHUB_REPOSITORY_OWNER}:${HEAD}" \
+            | jq 'length')"
+
+          if [ "${PR_COUNT}" -gt 0 ]; then
+            echo "A pull request already exists for ${HEAD}."
+            exit 0
+          fi
+
+          curl -sS -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${OWNER_REPO}/pulls" \
+            -d "$(jq -n \
+              --arg title "${TITLE}" \
+              --arg head "${HEAD}" \
+              --arg base "main" \
+              --arg body "${BODY}" \
+              '{title:$title, head:$head, base:$base, body:$body}')" \
+            | jq -r '.html_url // empty'

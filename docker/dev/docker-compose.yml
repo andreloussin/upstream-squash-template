@@ -1,0 +1,13 @@
+services:
+  app:
+    build:
+      context: ../..
+      dockerfile: docker/dev/Dockerfile
+    container_name: upstream-squash-template-dev
+    env_file:
+      - ../../.env
+    volumes:
+      - ../..:/app
+    working_dir: /app
+    tty: true
+    stdin_open: true

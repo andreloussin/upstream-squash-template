@@ -1,0 +1,9 @@
+services:
+  app:
+    build:
+      context: ../..
+      dockerfile: docker/staging/Dockerfile
+    container_name: upstream-squash-template-staging
+    env_file:
+      - ../../.env.staging
+    restart: unless-stopped
